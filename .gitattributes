@@ -1,0 +1,9 @@
+# Normalise line endings: LF in the repo, native in working copies.
+* text=auto eol=lf
+
+# Binary assets — never normalise.
+*.nitro binary
+*.swf   binary
+*.png   binary
+*.bin   binary
+*.zip   binary
