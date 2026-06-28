@@ -40,7 +40,17 @@ yarn build
 
 ## Configuration
 
-Rename `configuration.json.example` to `configuration.json`.
+Copy `configuration.json.example` to `configuration.json`:
+
+```bash
+# Linux / macOS
+cp configuration.json.example configuration.json
+```
+
+```powershell
+# Windows (PowerShell)
+Copy-Item configuration.json.example configuration.json
+```
 
 The simplest setup is to point `external.variables.url` at your external variables file — the converter pulls every URL from there when the matching key in the main config is `null` or `""`.
 
