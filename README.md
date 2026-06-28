@@ -38,6 +38,16 @@ yarn install
 yarn build
 ```
 
+## Updating
+
+```bash
+git pull
+yarn install   # only if dependencies changed
+yarn build
+```
+
+Your `configuration.json` is git-ignored, so updates never overwrite it.
+
 ## Configuration
 
 Copy `configuration.json.example` to `configuration.json`:
@@ -99,7 +109,7 @@ Existing assets are skipped, but XMLs are always re-converted and JSONs copied t
 
 ## Logging
 
-On startup the converter creates `logs/console.txt` (auto-created, recursive). It mirrors all `console.log/info/warn/error` output — terminal output is unchanged, everything is also appended to the file with timestamps, including stack traces and any subprocess output (stdout / stderr / exit code). The `logs/` folder is git-ignored.
+On startup the converter creates `logs/console.txt` (auto-created, recursive). It mirrors **everything** written to `stdout`/`stderr` — console logs, spinner status/success marks, errors and stack traces — to the file with timestamps, while leaving terminal output unchanged. ANSI colours are stripped and any subprocess output (stdout / stderr / exit code) is captured in a structured block. The `logs/` folder is git-ignored.
 
 ## Credits
 
