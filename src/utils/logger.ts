@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { createWriteStream, WriteStream } from 'fs';
+import { createWriteStream, existsSync, WriteStream } from 'fs';
 import { join } from 'path';
 import { format } from 'util';
 import { ensureDirSync } from './fs';
@@ -18,19 +18,46 @@ import { ensureDirSync } from './fs';
  *
  * The file is a separate WriteStream (its own fd), so mirroring never loops
  * back through the patched stdout/stderr writers — no recursion.
+ *
+ * Every captured line is tagged `[LOG]` rather than per-stream OUT/ERR: `ora`
+ * draws its spinner (including success ticks) on stderr, so a stream-based
+ * severity label would mark successes as errors. The line text itself carries
+ * the meaning.
  */
 
 const LOG_DIR = join(process.cwd(), 'logs');
 const LOG_FILE = join(LOG_DIR, 'console.txt');
 
-// CSI cursor-column (G) and erase-line (K) sequences used by spinner redraws;
-// normalising these to a carriage return lets us keep only a frame's final state.
-// eslint-disable-next-line no-control-regex
-const CURSOR_RESET_PATTERN = new RegExp('[\u001B\u009B]\[\d*[GK]', 'g');
+// ESC (0x1B) and CSI (0x9B) introducers, built from char codes so no raw
+// control byte ever lives in the source.
+const ANSI_INTRODUCER = '[' + String.fromCharCode(0x1B, 0x9B) + ']';
 
-// Matches ANSI escape sequences (colours, cursor moves, spinner show/hide).
-// eslint-disable-next-line no-control-regex
-const ANSI_PATTERN = new RegExp('[\u001B\u009B][[\]()#;?]*(?:(?:\d{1,4}(?:;\d{0,4})*)?[0-9A-PRZcf-nqry=><]|[A-Za-z])', 'g');
+// ANSI escape sequences (colours, cursor moves, spinner show/hide).
+const ANSI_PATTERN = new RegExp(ANSI_INTRODUCER + '[[\\]()#;?]*(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[0-9A-PRZcf-nqry=><]|[A-Za-z])', 'g');
+
+// CSI cursor-column (G) / erase-line (K) redraws. Normalising these to a
+// carriage return lets us keep only a spinner line's final on-screen state.
+const CURSOR_RESET_PATTERN = new RegExp(ANSI_INTRODUCER + '\\[\\d*[GK]', 'g');
+
+// Severity markers written to the log file (built from code points so no raw
+// multibyte emoji ever lives in the source).
+const EMOJI_SUCCESS = String.fromCodePoint(0x2705);          // ✅
+const EMOJI_ERROR = String.fromCodePoint(0x274C);            // ❌
+const EMOJI_WARNING = String.fromCodePoint(0x26A0, 0xFE0F);  // ⚠️
+const EMOJI_INFO = String.fromCodePoint(0x2139, 0xFE0F);     // ℹ️
+const MARKER_PLAIN = '[LOG]';
+
+// Leading glyphs that `ora` / `log-symbols` emit, mapped to a severity emoji.
+// Covers both the Unicode glyphs (UTF-8 terminals) and the Windows fallbacks.
+const SYMBOL_EMOJI: Record<string, string> = {
+    [String.fromCharCode(0x2714)]: EMOJI_SUCCESS,  // ✔
+    [String.fromCharCode(0x221A)]: EMOJI_SUCCESS,  // √ (Windows)
+    [String.fromCharCode(0x2716)]: EMOJI_ERROR,    // ✖
+    [String.fromCharCode(0x00D7)]: EMOJI_ERROR,    // × (Windows)
+    [String.fromCharCode(0x26A0)]: EMOJI_WARNING,  // ⚠
+    [String.fromCharCode(0x203C)]: EMOJI_WARNING,  // ‼ (Windows)
+    [String.fromCharCode(0x2139)]: EMOJI_INFO      // ℹ
+};
 
 let stream: WriteStream | null = null;
 let initialized = false;
@@ -43,6 +70,31 @@ function timestamp(): string
 function stripAnsi(value: string): string
 {
     return value.replace(ANSI_PATTERN, '');
+}
+
+/**
+ * Picks a severity marker for a captured line and returns it alongside the
+ * remaining text. A leading `ora` glyph wins; otherwise a few leading keywords
+ * are recognised; everything else is plain.
+ */
+function classifyLine(line: string): { marker: string; text: string }
+{
+    const emoji = SYMBOL_EMOJI[line.charAt(0)];
+
+    if(emoji)
+    {
+        // Drop the glyph, a trailing variation selector (U+FE0F), then spacing.
+        let rest = line.slice(1);
+
+        if(rest.charCodeAt(0) === 0xFE0F) rest = rest.slice(1);
+
+        return { marker: emoji, text: rest.trimStart() };
+    }
+
+    if(/^(error|invalid|failed)\b/i.test(line)) return { marker: EMOJI_ERROR, text: line };
+    if(/^warn(ing)?\b/i.test(line)) return { marker: EMOJI_WARNING, text: line };
+
+    return { marker: MARKER_PLAIN, text: line };
 }
 
 /**
@@ -61,12 +113,12 @@ function writeToFile(line: string): void
  * Wraps a writable stream's `write` so the terminal still receives the exact
  * original bytes, while a cleaned, line-buffered copy is appended to the log.
  *
- * Spinner frames are redrawn in place using carriage returns with no trailing
- * newline, so we only flush a log line when a `\n` is seen and keep just the
- * text after the final `\r` — i.e. the line's final on-screen state. Transient
- * intermediate frames are therefore collapsed instead of spamming the file.
+ * Spinner frames are redrawn in place (cursor/erase escapes, normalised to a
+ * carriage return above) with no trailing newline, so we only flush a log line
+ * on `\n`. ANSI is stripped first, then we keep just the text after the final
+ * `\r` — i.e. the line's final state — so transient frames don't spam the file.
  */
-function patchStream(target: NodeJS.WriteStream, label: string): void
+function patchStream(target: NodeJS.WriteStream): void
 {
     // The bound original is the only path to the real terminal from here on.
     const original = target.write.bind(target) as (...args: unknown[]) => boolean;
@@ -77,27 +129,28 @@ function patchStream(target: NodeJS.WriteStream, label: string): void
     {
         const raw = (typeof chunk === 'string') ? chunk : (Buffer.isBuffer(chunk) ? chunk.toString('utf8') : '');
 
-        // Spinners redraw in place with "cursor to column" (CSI G) and
-        // "erase line" (CSI K) escapes rather than carriage returns. Treat
-        // those as a carriage return so only the line's final state is logged.
-        const text = raw.replace(CURSOR_RESET_PATTERN, '\r');
-
-        pending += text;
+        pending += raw.replace(CURSOR_RESET_PATTERN, '\r');
 
         let newlineIndex: number;
 
         while((newlineIndex = pending.indexOf('\n')) !== -1)
         {
-            let line = pending.slice(0, newlineIndex);
+            const rawLine = pending.slice(0, newlineIndex);
             pending = pending.slice(newlineIndex + 1);
 
-            const carriageIndex = line.lastIndexOf('\r');
+            // Strip colours first so a carriage return can never land mid-escape
+            // and leave a fragment (e.g. a stray "39m") behind.
+            const stripped = stripAnsi(rawLine);
+            const carriageIndex = stripped.lastIndexOf('\r');
+            const finalState = (carriageIndex !== -1) ? stripped.slice(carriageIndex + 1) : stripped;
+            const clean = finalState.replace(/\s+$/, '');
 
-            if(carriageIndex !== -1) line = line.slice(carriageIndex + 1);
+            if(clean.length)
+            {
+                const { marker, text } = classifyLine(clean);
 
-            const clean = stripAnsi(line).replace(/\s+$/, '');
-
-            if(clean.length) writeToFile(`[${ timestamp() }] [${ label }] ${ clean }`);
+                writeToFile(`[${ timestamp() }] ${ marker } ${ text }`);
+            }
         }
 
         return original(chunk, ...rest);
@@ -108,8 +161,8 @@ function patchStream(target: NodeJS.WriteStream, label: string): void
 
 function patchStreams(): void
 {
-    patchStream(process.stdout, 'OUT');
-    patchStream(process.stderr, 'ERR');
+    patchStream(process.stdout);
+    patchStream(process.stderr);
 }
 
 /**
@@ -122,8 +175,14 @@ export function initLogger(): void
 
     ensureDirSync(LOG_DIR);
 
-    stream = createWriteStream(LOG_FILE, { flags: 'a' });
+    // Append to the existing log; prepend a UTF-8 BOM on first creation so
+    // editors (Notepad) reliably decode emojis and other multibyte content.
+    const isNewFile = !existsSync(LOG_FILE);
+
+    stream = createWriteStream(LOG_FILE, { flags: 'a', encoding: 'utf8' });
     initialized = true;
+
+    if(isNewFile) stream.write(String.fromCharCode(0xFEFF));
 
     patchStreams();
     filterDeprecationWarnings();
