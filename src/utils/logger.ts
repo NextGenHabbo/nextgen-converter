@@ -9,26 +9,28 @@ import { ensureDirSync } from './fs';
  *
  * Responsibilities:
  *  - Ensure `<cwd>/logs/console.txt` exists on startup (recursive mkdir).
- *  - Mirror every `console.log/info/warn/error` call into that file while
- *    leaving terminal output untouched.
+ *  - Mirror EVERYTHING written to stdout/stderr into that file while leaving
+ *    terminal output untouched. Intercepting at the stream level (rather than
+ *    `console.*`) means `ora` spinner ticks, success marks and any third-party
+ *    direct writes are captured too — not just `console` calls.
  *  - Capture stdout/stderr/exit-code of any spawned subprocess (PowerShell or
  *    otherwise) in a structured, greppable format.
  *
- * The original console methods are captured once and used for all terminal
- * writes, so re-entrancy / recursion is impossible.
+ * The file is a separate WriteStream (its own fd), so mirroring never loops
+ * back through the patched stdout/stderr writers — no recursion.
  */
 
 const LOG_DIR = join(process.cwd(), 'logs');
 const LOG_FILE = join(LOG_DIR, 'console.txt');
 
-type ConsoleMethod = 'log' | 'info' | 'warn' | 'error';
+// CSI cursor-column (G) and erase-line (K) sequences used by spinner redraws;
+// normalising these to a carriage return lets us keep only a frame's final state.
+// eslint-disable-next-line no-control-regex
+const CURSOR_RESET_PATTERN = new RegExp('[\u001B\u009B]\[\d*[GK]', 'g');
 
-const ORIGINAL_CONSOLE: Record<ConsoleMethod, (...args: unknown[]) => void> = {
-    log: console.log.bind(console),
-    info: console.info.bind(console),
-    warn: console.warn.bind(console),
-    error: console.error.bind(console)
-};
+// Matches ANSI escape sequences (colours, cursor moves, spinner show/hide).
+// eslint-disable-next-line no-control-regex
+const ANSI_PATTERN = new RegExp('[\u001B\u009B][[\]()#;?]*(?:(?:\d{1,4}(?:;\d{0,4})*)?[0-9A-PRZcf-nqry=><]|[A-Za-z])', 'g');
 
 let stream: WriteStream | null = null;
 let initialized = false;
@@ -38,10 +40,15 @@ function timestamp(): string
     return new Date().toISOString();
 }
 
+function stripAnsi(value: string): string
+{
+    return value.replace(ANSI_PATTERN, '');
+}
+
 /**
- * Writes a pre-formatted line straight to the log file, bypassing the console
- * entirely. This is the single low-level sink; everything else funnels here so
- * there is no path back into the patched console methods.
+ * Writes a pre-formatted line straight to the log file's own stream. This is
+ * the single low-level sink; it never touches stdout/stderr, so the patched
+ * writers below can't recurse into it.
  */
 function writeToFile(line: string): void
 {
@@ -50,21 +57,59 @@ function writeToFile(line: string): void
     stream.write(line.endsWith('\n') ? line : `${ line }\n`);
 }
 
-function patchConsole(): void
+/**
+ * Wraps a writable stream's `write` so the terminal still receives the exact
+ * original bytes, while a cleaned, line-buffered copy is appended to the log.
+ *
+ * Spinner frames are redrawn in place using carriage returns with no trailing
+ * newline, so we only flush a log line when a `\n` is seen and keep just the
+ * text after the final `\r` — i.e. the line's final on-screen state. Transient
+ * intermediate frames are therefore collapsed instead of spamming the file.
+ */
+function patchStream(target: NodeJS.WriteStream, label: string): void
 {
-    const levels: ConsoleMethod[] = [ 'log', 'info', 'warn', 'error' ];
+    // The bound original is the only path to the real terminal from here on.
+    const original = target.write.bind(target) as (...args: unknown[]) => boolean;
 
-    for(const level of levels)
+    let pending = '';
+
+    const patched = (chunk: unknown, ...rest: unknown[]): boolean =>
     {
-        console[level] = (...args: unknown[]): void =>
-        {
-            // Terminal output stays exactly as it was.
-            ORIGINAL_CONSOLE[level](...args);
+        const raw = (typeof chunk === 'string') ? chunk : (Buffer.isBuffer(chunk) ? chunk.toString('utf8') : '');
 
-            // Duplicate, formatted, into the log file.
-            writeToFile(`[${ timestamp() }] [${ level.toUpperCase() }] ${ format(...args) }`);
-        };
-    }
+        // Spinners redraw in place with "cursor to column" (CSI G) and
+        // "erase line" (CSI K) escapes rather than carriage returns. Treat
+        // those as a carriage return so only the line's final state is logged.
+        const text = raw.replace(CURSOR_RESET_PATTERN, '\r');
+
+        pending += text;
+
+        let newlineIndex: number;
+
+        while((newlineIndex = pending.indexOf('\n')) !== -1)
+        {
+            let line = pending.slice(0, newlineIndex);
+            pending = pending.slice(newlineIndex + 1);
+
+            const carriageIndex = line.lastIndexOf('\r');
+
+            if(carriageIndex !== -1) line = line.slice(carriageIndex + 1);
+
+            const clean = stripAnsi(line).replace(/\s+$/, '');
+
+            if(clean.length) writeToFile(`[${ timestamp() }] [${ label }] ${ clean }`);
+        }
+
+        return original(chunk, ...rest);
+    };
+
+    target.write = patched as typeof target.write;
+}
+
+function patchStreams(): void
+{
+    patchStream(process.stdout, 'OUT');
+    patchStream(process.stderr, 'ERR');
 }
 
 /**
@@ -80,13 +125,41 @@ export function initLogger(): void
     stream = createWriteStream(LOG_FILE, { flags: 'a' });
     initialized = true;
 
-    patchConsole();
+    patchStreams();
+    filterDeprecationWarnings();
 
     writeToFile(`\n[${ timestamp() }] [START] Program started (argv: ${ process.argv.slice(2).join(' ') || 'none' })`);
 
     // Make sure unexpected crashes still land in the log with a stack trace.
     process.on('uncaughtException', (error) => writeToFile(`[${ timestamp() }] [FATAL] ${ format(error) }`));
     process.on('unhandledRejection', (reason) => writeToFile(`[${ timestamp() }] [FATAL] Unhandled rejection: ${ format(reason) }`));
+}
+
+/**
+ * Deprecation warning codes emitted by abandoned transitive dependencies that
+ * we cannot upgrade. These are harmless noise; we swallow exactly these and
+ * still surface every other warning.
+ *
+ *  - DEP0060: `util._extend` -> used by `proxying-agent` (via `tinify`).
+ */
+const SUPPRESSED_WARNING_CODES = new Set<string>([ 'DEP0060' ]);
+
+/**
+ * Replaces Node's default `warning` handler with one that drops a small
+ * allow-list of known-harmless deprecation codes and logs everything else
+ * through `console.warn` (so it still lands in the log file).
+ */
+function filterDeprecationWarnings(): void
+{
+    // Removing the internal listener stops Node printing every warning twice.
+    process.removeAllListeners('warning');
+
+    process.on('warning', (warning: Error & { code?: string }) =>
+    {
+        if(warning.code && SUPPRESSED_WARNING_CODES.has(warning.code)) return;
+
+        console.warn(warning.stack ?? warning.message);
+    });
 }
 
 /** Result of a captured subprocess run. */
@@ -103,7 +176,7 @@ export interface CommandResult
  * (PowerShell, etc.) is launched so its output is never lost.
  *
  * Terminal behaviour is preserved: captured output is also echoed through the
- * (already patched) console.
+ * (already patched) stdout/stderr.
  */
 export function runCommandLogged(command: string, args: string[] = []): Promise<CommandResult>
 {
